@@ -44,13 +44,20 @@ export default function LandingPage() {
         headers: { 'Content-Type': 'application/json', 'x-session-id': getSessionId() },
         body: JSON.stringify({ prompt })
       });
-      const data = await res.json();
-      if (data.id) {
-        navigate(`/build/${data.id}`);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.id) {
+        // Surface what the API actually said. A bare "failed to submit" sends you
+        // hunting through CORS noise when the real answer is in the response body.
+        throw new Error(data.error || `API returned ${res.status} ${res.statusText}`);
       }
+      navigate(`/build/${data.id}`);
     } catch (err) {
       console.error(err);
-      alert("Failed to submit prompt");
+      alert(
+        `Could not start the build: ${err.message}\n\n` +
+        `API: ${getApiUrl()}\n` +
+        `If this says "Failed to fetch", the API service is down — check /health on it.`
+      );
     } finally {
       setLoading(false);
     }

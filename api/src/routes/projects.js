@@ -7,11 +7,19 @@ module.exports = async function (fastify, opts) {
   // forever with the UI spinning. Mark it failed and surface a 503 instead.
   async function enqueue(projectId, payload) {
     try {
+      if (!fastify.nc || fastify.nc.isClosed()) {
+        throw new Error('not connected to NATS');
+      }
       fastify.nc.publish('build.jobs', jc.encode(payload));
     } catch (err) {
       fastify.log.error(`Failed to enqueue build for ${projectId}: ${err.message}`);
-      await fastify.db.query("UPDATE projects SET status = 'failed' WHERE id = $1", [projectId]);
-      const e = new Error('Build queue unavailable, please retry.');
+      try {
+        await fastify.db.query("UPDATE projects SET status = 'failed' WHERE id = $1", [projectId]);
+      } catch (dbErr) {
+        // Best effort — don't let a second failure mask the 503 we owe the client.
+        fastify.log.error(`Also failed to mark ${projectId} failed: ${dbErr.message}`);
+      }
+      const e = new Error(`Build queue unavailable (${err.message}). Check the API's /health.`);
       e.statusCode = 503;
       throw e;
     }
