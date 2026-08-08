@@ -25,7 +25,7 @@ zerops:
       start: node index.js
       envVariables:
         DATABASE_URL: postgresql://${db_user}:${db_password}@${db_hostname}:5432/${db_dbName}
-        REDIS_URL: redis://${cache_hostname}:6379
+        REDIS_URL: redis://default:${cache_password}@${cache_hostname}:6379
         NATS_URL: nats://${queue_hostname}:4222
 
   - setup: worker
@@ -39,7 +39,8 @@ zerops:
       base: python@3.12
       start: python worker/main.py
       envVariables:
+        PYTHONPATH: worker/.python_packages
         DATABASE_URL: postgresql://${db_user}:${db_password}@${db_hostname}:5432/${db_dbName}
-        REDIS_URL: redis://${cache_hostname}:6379
+        REDIS_URL: redis://default:${cache_password}@${cache_hostname}:6379
         NATS_URL: nats://${queue_hostname}:4222
         QDRANT_URL: http://${vectors_hostname}:6333
