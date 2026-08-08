@@ -9,6 +9,10 @@ from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
+# gemini-1.5-* is fully retired and returns 404. Override via env if you want
+# to trade cost for quality (e.g. a preview Pro model).
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
+
 class ArchitectOutput(BaseModel):
     title: str = Field(description="The title of the app")
     features: List[str] = Field(description="3 to 5 core features of the app")
@@ -23,11 +27,23 @@ ARCHITECT_SYSTEM_PROMPT = """You are the Architect agent in a 3-agent team that 
 Everything must be achievable as a single self-contained HTML file with inline React — no backend calls, no external APIs.
 """
 
-BUILDER_SYSTEM_PROMPT = """You are the Builder agent. Given the Architect's plan (and any Reviewer issues), output ONE complete HTML document:
-Tailwind via the CDN script tag, React + ReactDOM + Babel standalone via CDN script tags, one inline <script type="text/babel"> mounting the app to #root.
-Client-side state only (useState/useReducer), realistic mock data, no network calls except https://picsum.photos for placeholder images if truly needed.
+BUILDER_SYSTEM_PROMPT = """You are the Builder agent. Given the Architect's plan (and any Reviewer issues), output ONE complete HTML document.
+
+The document is rendered inside a locked-down sandboxed iframe, so you MUST use exactly these
+four CDN tags and no others — any other host is blocked by CSP and the app will render blank:
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+Then one inline <script type="text/babel"> that defines the app and mounts it with
+ReactDOM.createRoot(document.getElementById('root')).render(<App />).
+Client-side state only (useState/useReducer) — destructure hooks from the global React object.
+Realistic mock data, no network calls, no localStorage, no fetch. Images only from https://picsum.photos.
 Make it visually polished with a real color palette and at least one working interaction.
-Output ONLY the raw HTML — no explanation, no markdown code fences."""
+
+Keep the whole document under ~500 lines so it never gets truncated.
+Output ONLY the raw HTML starting with <!doctype html> — no explanation, no markdown code fences."""
 
 REVIEWER_SYSTEM_PROMPT = """You are the Reviewer agent, a strict but fair QA engineer. 
 Approve unless something is visibly broken, unstyled, or missing a core feature from the plan. Keep issues short and actionable."""
@@ -51,7 +67,7 @@ class AgentLoop:
         # Run synchronous call in thread pool
         arch_response = await asyncio.to_thread(
             self.client.models.generate_content,
-            model='gemini-1.5-pro',
+            model=GEMINI_MODEL,
             contents=user_msg,
             config=types.GenerateContentConfig(
                 system_instruction=ARCHITECT_SYSTEM_PROMPT,
@@ -69,7 +85,7 @@ class AgentLoop:
         if parent_html:
             builder_msg += f"\n\nMake sure to start from this EXISTING HTML:\n{parent_html}"
             
-        html_out = await self._stream_builder(builder_msg)
+        html_out = await self._build_html(builder_msg)
         await self.publish_artifact(html_out)
         await self.publish_status("builder", "done")
 
@@ -79,7 +95,7 @@ class AgentLoop:
         logger.info("Calling Reviewer...")
         rev_response = await asyncio.to_thread(
             self.client.models.generate_content,
-            model='gemini-1.5-pro',
+            model=GEMINI_MODEL,
             contents=reviewer_msg,
             config=types.GenerateContentConfig(
                 system_instruction=REVIEWER_SYSTEM_PROMPT,
@@ -103,7 +119,7 @@ class AgentLoop:
         revision_msg = builder_msg + f"\n\nREVIEWER ISSUES to fix:\n{issues}"
         
         logger.info("Running Builder Revision...")
-        html_out_2 = await self._stream_builder(revision_msg)
+        html_out_2 = await self._build_html(revision_msg)
         await self.publish_artifact(html_out_2)
         await self.publish_status("builder", "done")
         
@@ -115,10 +131,13 @@ class AgentLoop:
         # Since the iterator might do network I/O, we can wrap the `next()` calls.
         def get_stream():
             return self.client.models.generate_content_stream(
-                model='gemini-1.5-pro',
+                model=GEMINI_MODEL,
                 contents=message,
                 config=types.GenerateContentConfig(
                     system_instruction=BUILDER_SYSTEM_PROMPT,
+                    # A full polished HTML app blows past the default output cap and
+                    # comes back silently truncated, which renders as a broken preview.
+                    max_output_tokens=32768,
                 )
             )
             
@@ -156,5 +175,26 @@ class AgentLoop:
             clean_html = clean_html[3:]
         if clean_html.endswith("```"):
             clean_html = clean_html[:-3]
-            
+
         return clean_html.strip()
+
+    @staticmethod
+    def _looks_like_html(html: str) -> bool:
+        head = html[:200].lstrip().lower()
+        return head.startswith("<!doctype html") and "</html>" in html[-2000:].lower()
+
+    async def _build_html(self, message: str) -> str:
+        """Stream the Builder, and retry once if the model returned something that
+        isn't a complete HTML document (truncated output, stray prose, etc)."""
+        html = await self._stream_builder(message)
+        if self._looks_like_html(html):
+            return html
+
+        logger.warning("Builder returned malformed HTML (%d chars), retrying once.", len(html))
+        retry_msg = (
+            message
+            + "\n\nYour previous answer was not a complete HTML document. Output ONLY a "
+              "complete document starting with <!doctype html> and ending with </html>. "
+              "Keep it shorter so it fits in one response."
+        )
+        return await self._stream_builder(retry_msg)

@@ -1,9 +1,9 @@
 import React, { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { ArrowLeft, ExternalLink, ThumbsUp } from 'lucide-react';
-import { getApiUrl } from '../config';
+import { getApiUrl, getSessionId } from '../config';
+import { withCsp } from '../sandbox';
 
-const CSP = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' https://cdn.tailwindcss.com https://unpkg.com; style-src 'unsafe-inline'; img-src https: data:;">`;
 
 export default function AppPage() {
   const { id } = useParams();
@@ -23,12 +23,8 @@ export default function AppPage() {
 
   const handleLike = async () => {
     try {
-      let sessionId = localStorage.getItem('session_id');
-      if (!sessionId) {
-        sessionId = crypto.randomUUID();
-        localStorage.setItem('session_id', sessionId);
-      }
-      
+      const sessionId = getSessionId();
+
       const res = await fetch(`${getApiUrl()}/api/projects/${id}/like`, {
         method: 'POST',
         headers: { 'x-session-id': sessionId }
@@ -68,7 +64,7 @@ export default function AppPage() {
         ) : (
           <iframe
             title="Standalone App"
-            srcDoc={CSP + html}
+            srcDoc={withCsp(html)}
             sandbox="allow-scripts"
             className="w-full h-full border-none"
           />

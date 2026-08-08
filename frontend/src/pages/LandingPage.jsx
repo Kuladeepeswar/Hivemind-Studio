@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Sparkles, ArrowRight, Activity } from 'lucide-react';
-import { getApiUrl, getWsUrl } from '../config';
+import { getApiUrl, getWsUrl, getSessionId } from '../config';
 
 const EXAMPLES = [
   "A habit tracker with streaks",
@@ -41,7 +41,7 @@ export default function LandingPage() {
     try {
       const res = await fetch(`${getApiUrl()}/api/projects`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'x-session-id': getSessionId() },
         body: JSON.stringify({ prompt })
       });
       const data = await res.json();

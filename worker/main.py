@@ -22,6 +22,11 @@ REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
 NATS_URL = os.environ.get("NATS_URL", "nats://localhost:4222")
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
 
+EMBED_MODEL = os.environ.get("GEMINI_EMBED_MODEL", "gemini-embedding-2")
+# gemini-embedding-2 defaults to 3072 dims; we truncate to 768 to keep the
+# Qdrant collection small. Must stay in sync with init_qdrant below.
+EMBED_DIM = 768
+
 
 async def init_qdrant(qdrant):
     # Ensure collection exists
@@ -30,7 +35,7 @@ async def init_qdrant(qdrant):
         if not any(c.name == "builds" for c in collections.collections):
             await qdrant.create_collection(
                 collection_name="builds",
-                vectors_config=VectorParams(size=768, distance=Distance.COSINE),
+                vectors_config=VectorParams(size=EMBED_DIM, distance=Distance.COSINE),
             )
     except Exception as e:
         logger.error(f"Failed to init Qdrant: {e}")
@@ -112,31 +117,38 @@ async def main():
                     artifact_id = (await acur.fetchone())[0]
                     await acur.execute("UPDATE projects SET status = 'done' WHERE id = %s", (project_id,))
             
-            # Embed and save to Qdrant
-            arch_plan = json.loads(arch_plan_str)
-            title = arch_plan.get("title", "App")
-            text_to_embed = f"{title} {prompt}"
-            
-            # Use Gemini embedding
-            from google import genai
-            gclient = genai.Client()
-            emb_res = await asyncio.to_thread(
-                gclient.models.embed_content,
-                model='text-embedding-004',
-                contents=text_to_embed,
-            )
-            vector = emb_res.embeddings[0].values
+            # Embed and save to Qdrant. This is memory for future builds, not part of
+            # the core loop — a Qdrant or embedding hiccup must never fail a build whose
+            # artifact is already saved and marked done.
+            try:
+                arch_plan = json.loads(arch_plan_str)
+                title = arch_plan.get("title", "App")
+                text_to_embed = f"{title} {prompt}"
 
-            await qclient.upsert(
-                collection_name="builds",
-                points=[
-                    PointStruct(
-                        id=str(project_id),
-                        vector=vector,
-                        payload={"projectId": str(project_id), "prompt": prompt, "title": title}
-                    )
-                ]
-            )
+                # Use Gemini embedding. text-embedding-004 was shut down in Jan 2026.
+                from google import genai
+                from google.genai import types as genai_types
+                gclient = genai.Client()
+                emb_res = await asyncio.to_thread(
+                    gclient.models.embed_content,
+                    model=EMBED_MODEL,
+                    contents=text_to_embed,
+                    config=genai_types.EmbedContentConfig(output_dimensionality=EMBED_DIM),
+                )
+                vector = emb_res.embeddings[0].values
+
+                await qclient.upsert(
+                    collection_name="builds",
+                    points=[
+                        PointStruct(
+                            id=str(project_id),
+                            vector=vector,
+                            payload={"projectId": str(project_id), "prompt": prompt, "title": title}
+                        )
+                    ]
+                )
+            except Exception as qe:
+                logger.warning(f"Vector memory upsert failed for {project_id}: {qe}")
 
             # Publish completion
             msg_obj = {"type": "build.completed", "projectId": project_id, "artifactId": str(artifact_id)}

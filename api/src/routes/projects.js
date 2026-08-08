@@ -3,6 +3,20 @@ const jc = JSONCodec();
 const crypto = require('crypto');
 
 module.exports = async function (fastify, opts) {
+  // If the job never reaches the worker, the project would sit in "queued"
+  // forever with the UI spinning. Mark it failed and surface a 503 instead.
+  async function enqueue(projectId, payload) {
+    try {
+      fastify.nc.publish('build.jobs', jc.encode(payload));
+    } catch (err) {
+      fastify.log.error(`Failed to enqueue build for ${projectId}: ${err.message}`);
+      await fastify.db.query("UPDATE projects SET status = 'failed' WHERE id = $1", [projectId]);
+      const e = new Error('Build queue unavailable, please retry.');
+      e.statusCode = 503;
+      throw e;
+    }
+  }
+
   // POST /api/projects
   fastify.post('/', async (request, reply) => {
     const { prompt } = request.body;
@@ -14,13 +28,7 @@ module.exports = async function (fastify, opts) {
     );
     const project = dbRes.rows[0];
 
-    // Publish to NATS
-    if (fastify.nc) {
-      fastify.nc.publish("build.jobs", jc.encode({
-        projectId: project.id,
-        prompt: prompt
-      }));
-    }
+    await enqueue(project.id, { projectId: project.id, prompt });
 
     return { id: project.id, status: project.status, sessionId };
   });
@@ -80,14 +88,11 @@ module.exports = async function (fastify, opts) {
     );
     const newProject = dbRes.rows[0];
 
-    // Publish to NATS
-    if (fastify.nc) {
-      fastify.nc.publish("build.jobs", jc.encode({
-        projectId: newProject.id,
-        prompt: prompt,
-        parentHtml: parentHtml
-      }));
-    }
+    await enqueue(newProject.id, {
+      projectId: newProject.id,
+      prompt,
+      parentHtml,
+    });
 
     return { id: newProject.id, status: newProject.status, sessionId };
   });

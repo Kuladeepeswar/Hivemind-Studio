@@ -1,6 +1,6 @@
 create extension if not exists pgcrypto;
 
-create table projects (
+create table if not exists projects (
   id uuid primary key default gen_random_uuid(),
   prompt text not null,
   parent_id uuid references projects(id),
@@ -11,7 +11,7 @@ create table projects (
   updated_at timestamptz not null default now()
 );
 
-create table agent_events (
+create table if not exists agent_events (
   id bigserial primary key,
   project_id uuid not null references projects(id) on delete cascade,
   agent text not null,       -- architect | builder | reviewer | system
@@ -20,7 +20,7 @@ create table agent_events (
   created_at timestamptz not null default now()
 );
 
-create table artifacts (
+create table if not exists artifacts (
   id uuid primary key default gen_random_uuid(),
   project_id uuid not null references projects(id) on delete cascade,
   version int not null default 1,
@@ -29,10 +29,10 @@ create table artifacts (
   created_at timestamptz not null default now()
 );
 
-create table likes (
+create table if not exists likes (
   project_id uuid references projects(id) on delete cascade,
   session_id text not null,
   primary key (project_id, session_id)
 );
 
-create index on agent_events (project_id, created_at);
+create index if not exists agent_events_project_created_idx on agent_events (project_id, created_at);

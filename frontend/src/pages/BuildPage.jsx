@@ -1,9 +1,9 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { Play, Check, Loader2, ArrowRight } from 'lucide-react';
-import { getApiUrl, getWsUrl } from '../config';
+import { getApiUrl, getWsUrl, getSessionId } from '../config';
+import { withCsp } from '../sandbox';
 
-const CSP = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' https://cdn.tailwindcss.com https://unpkg.com; style-src 'unsafe-inline'; img-src https: data:;">`;
 
 export default function BuildPage() {
   const { id } = useParams();
@@ -132,7 +132,7 @@ export default function BuildPage() {
                 if (remixPrompt) {
                   fetch(`${getApiUrl()}/api/projects/${id}/remix`, {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: { 'Content-Type': 'application/json', 'x-session-id': getSessionId() },
                     body: JSON.stringify({ prompt: remixPrompt })
                   })
                   .then(res => res.json())
@@ -161,7 +161,7 @@ export default function BuildPage() {
           ) : (
             <iframe
               title="Preview"
-              srcDoc={CSP + html}
+              srcDoc={withCsp(html)}
               sandbox="allow-scripts"
               className="w-full h-full border-none"
             />
