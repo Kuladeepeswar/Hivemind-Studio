@@ -8,7 +8,7 @@ import nats
 import redis.asyncio as redis
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import PointStruct, VectorParams, Distance
-from sentence_transformers import SentenceTransformer
+
 import psycopg
 
 from agent_loop import AgentLoop
@@ -22,12 +22,6 @@ REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
 NATS_URL = os.environ.get("NATS_URL", "nats://localhost:4222")
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
 
-# Initialize Sentence Transformer
-try:
-    encoder = SentenceTransformer('all-MiniLM-L6-v2')
-except Exception as e:
-    logger.warning(f"Could not load sentence transformer: {e}")
-    encoder = None
 
 async def init_qdrant(qdrant):
     # Ensure collection exists
@@ -36,7 +30,7 @@ async def init_qdrant(qdrant):
         if not any(c.name == "builds" for c in collections.collections):
             await qdrant.create_collection(
                 collection_name="builds",
-                vectors_config=VectorParams(size=384, distance=Distance.COSINE),
+                vectors_config=VectorParams(size=768, distance=Distance.COSINE),
             )
     except Exception as e:
         logger.error(f"Failed to init Qdrant: {e}")
@@ -119,21 +113,30 @@ async def main():
                     await acur.execute("UPDATE projects SET status = 'done' WHERE id = %s", (project_id,))
             
             # Embed and save to Qdrant
-            if encoder:
-                arch_plan = json.loads(arch_plan_str)
-                title = arch_plan.get("title", "App")
-                text_to_embed = f"{title} {prompt}"
-                vector = encoder.encode(text_to_embed).tolist()
-                await qclient.upsert(
-                    collection_name="builds",
-                    points=[
-                        PointStruct(
-                            id=str(project_id),
-                            vector=vector,
-                            payload={"projectId": str(project_id), "prompt": prompt, "title": title}
-                        )
-                    ]
-                )
+            arch_plan = json.loads(arch_plan_str)
+            title = arch_plan.get("title", "App")
+            text_to_embed = f"{title} {prompt}"
+            
+            # Use Gemini embedding
+            from google import genai
+            gclient = genai.Client()
+            emb_res = await asyncio.to_thread(
+                gclient.models.embed_content,
+                model='text-embedding-004',
+                contents=text_to_embed,
+            )
+            vector = emb_res.embeddings[0].values
+
+            await qclient.upsert(
+                collection_name="builds",
+                points=[
+                    PointStruct(
+                        id=str(project_id),
+                        vector=vector,
+                        payload={"projectId": str(project_id), "prompt": prompt, "title": title}
+                    )
+                ]
+            )
 
             # Publish completion
             msg_obj = {"type": "build.completed", "projectId": project_id, "artifactId": str(artifact_id)}

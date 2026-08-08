@@ -32,9 +32,7 @@ zerops:
     build:
       base: python@3.12
       buildCommands:
-        - cd worker && pip install --upgrade pip
-        - cd worker && pip install torch==2.3.1+cpu --index-url https://download.pytorch.org/whl/cpu --target .python_packages --break-system-packages
-        - cd worker && pip install --no-cache-dir -r requirements.txt --target .python_packages --break-system-packages
+        - cd worker && pip install -r requirements.txt --target .python_packages --break-system-packages
       deployFiles:
         - worker
     run:
