@@ -1,0 +1,29 @@
+project:
+  name: hivemind-studio
+
+services:
+  - hostname: web
+    type: static
+    enableSubdomainAccess: true
+
+  - hostname: api
+    type: nodejs@22
+    enableSubdomainAccess: true
+
+  - hostname: worker
+    type: python@3.12
+
+  - hostname: db
+    type: postgresql:single@16
+
+  - hostname: cache
+    type: valkey@7.2
+
+  - hostname: queue
+    type: nats@2.12
+
+  - hostname: vectors
+    type: qdrant@1.12
+
+  - hostname: storage
+    type: object-storage
