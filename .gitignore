@@ -10,6 +10,9 @@ venv/
 .env.local
 *.local
 
+# test_cli.py scratch output
+worker/last_build*.html
+
 .DS_Store
 .idea/
 .vscode/*
