@@ -1,13 +1,14 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Sparkles, Heart } from 'lucide-react';
+import { getApiUrl } from '../config';
 
 export default function GalleryPage() {
   const [projects, setProjects] = useState([]);
   const navigate = useNavigate();
 
   useEffect(() => {
-    fetch(`http://${window.location.hostname}:3000/api/projects?sort=popular&limit=20`)
+    fetch(`${getApiUrl()}/api/projects?sort=popular&limit=20`)
       .then(res => res.json())
       .then(data => setProjects(data))
       .catch(console.error);

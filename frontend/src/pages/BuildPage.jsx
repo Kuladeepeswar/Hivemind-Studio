@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { Play, Check, Loader2, ArrowRight } from 'lucide-react';
+import { getApiUrl, getWsUrl } from '../config';
 
 const CSP = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' https://cdn.tailwindcss.com https://unpkg.com; style-src 'unsafe-inline'; img-src https: data:;">`;
 
@@ -21,7 +22,7 @@ export default function BuildPage() {
 
   useEffect(() => {
     // Initial fetch
-    fetch(`http://${window.location.hostname}:3000/api/projects/${id}`)
+    fetch(`${getApiUrl()}/api/projects/${id}`)
       .then(res => res.json())
       .then(data => {
         if (data.project) setStatus(data.project.status);
@@ -30,7 +31,7 @@ export default function BuildPage() {
       .catch(console.error);
 
     // Setup WS
-    const wsUrl = `ws://${window.location.hostname}:3000/ws/projects/${id}`;
+    const wsUrl = `${getWsUrl()}/ws/projects/${id}`;
     const ws = new WebSocket(wsUrl);
 
     ws.onmessage = (event) => {
@@ -129,7 +130,7 @@ export default function BuildPage() {
               onClick={() => {
                 const remixPrompt = prompt("What do you want to change?");
                 if (remixPrompt) {
-                  fetch(`http://${window.location.hostname}:3000/api/projects/${id}/remix`, {
+                  fetch(`${getApiUrl()}/api/projects/${id}/remix`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ prompt: remixPrompt })

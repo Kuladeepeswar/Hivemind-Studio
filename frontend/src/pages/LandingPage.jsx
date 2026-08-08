@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Sparkles, ArrowRight, Activity } from 'lucide-react';
+import { getApiUrl, getWsUrl } from '../config';
 
 const EXAMPLES = [
   "A habit tracker with streaks",
@@ -17,7 +18,7 @@ export default function LandingPage() {
 
   useEffect(() => {
     // Setup Firehose WebSocket
-    const wsUrl = `ws://${window.location.hostname}:3000/ws/firehose`;
+    const wsUrl = `${getWsUrl()}/ws/firehose`;
     const ws = new WebSocket(wsUrl);
     
     ws.onmessage = (event) => {
@@ -38,7 +39,7 @@ export default function LandingPage() {
     
     setLoading(true);
     try {
-      const res = await fetch(`http://${window.location.hostname}:3000/api/projects`, {
+      const res = await fetch(`${getApiUrl()}/api/projects`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ prompt })

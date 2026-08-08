@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { ArrowLeft, ExternalLink, ThumbsUp } from 'lucide-react';
+import { getApiUrl } from '../config';
 
 const CSP = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' https://cdn.tailwindcss.com https://unpkg.com; style-src 'unsafe-inline'; img-src https: data:;">`;
 
@@ -11,7 +12,7 @@ export default function AppPage() {
   const [likes, setLikes] = useState(0);
 
   useEffect(() => {
-    fetch(`http://${window.location.hostname}:3000/api/projects/${id}`)
+    fetch(`${getApiUrl()}/api/projects/${id}`)
       .then(res => res.json())
       .then(data => {
         if (data.artifact) setHtml(data.artifact.html);
@@ -28,7 +29,7 @@ export default function AppPage() {
         localStorage.setItem('session_id', sessionId);
       }
       
-      const res = await fetch(`http://${window.location.hostname}:3000/api/projects/${id}/like`, {
+      const res = await fetch(`${getApiUrl()}/api/projects/${id}/like`, {
         method: 'POST',
         headers: { 'x-session-id': sessionId }
       });
