@@ -77,20 +77,6 @@ rebuilding the frontend.
 The worker applies `worker/schema.sql` on startup. There's no separate migration step and
 the schema is idempotent, so restarts are fine.
 
-## Checking it works
-
-```
-curl https://<your-api-host>/health
-```
-
-```json
-{"ok":true,"nats":"up","db":"up","schema":"up","redis":"up"}
-```
-
-If something is down, the response includes the masked connection string it actually
-received and the last error from the client. An unresolved `${...}` placeholder shows up
-here immediately, which saves a lot of time compared to reading container logs.
-
 ## Running the agent loop locally
 
 ```bash
