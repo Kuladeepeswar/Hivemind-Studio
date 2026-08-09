@@ -12,6 +12,21 @@ logger = logging.getLogger(__name__)
 # gemini-1.5-* is fully retired and returns 404. Override via env if you want
 # to trade cost for quality (e.g. a preview Pro model).
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
+# Used only after the primary model has exhausted its retries, so a capacity spike
+# on one model doesn't take the whole demo down.
+GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash-lite")
+
+# 429 = rate limited, 5xx = upstream capacity. All transient and worth retrying;
+# 400/403/404 (bad key, bad model id) are not and must surface immediately.
+RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+
+def _is_retryable(exc: Exception) -> bool:
+    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    if isinstance(code, int) and code in RETRYABLE_STATUS:
+        return True
+    text = str(exc).upper()
+    return any(m in text for m in ("UNAVAILABLE", "RESOURCE_EXHAUSTED", "INTERNAL", "OVERLOADED"))
 
 class ArchitectOutput(BaseModel):
     title: str = Field(description="The title of the app")
@@ -55,6 +70,29 @@ class AgentLoop:
         self.publish_artifact = publish_artifact_cb
         self.client = genai.Client()
 
+    async def _with_retry(self, make_call, label: str, attempts: int = 4):
+        """Run a Gemini call, retrying transient upstream failures.
+
+        `make_call` takes a model id so the last attempt can fall back to a
+        different model when the primary one is saturated.
+        """
+        delay = 2.0
+        for attempt in range(1, attempts + 1):
+            model = GEMINI_MODEL if attempt < attempts else GEMINI_FALLBACK_MODEL
+            try:
+                return await make_call(model)
+            except Exception as exc:
+                if not _is_retryable(exc) or attempt == attempts:
+                    raise
+                logger.warning(
+                    "%s failed on %s (attempt %d/%d): %s — retrying in %.0fs",
+                    label, model, attempt, attempts, exc, delay,
+                )
+                # Keep the UI honest instead of looking frozen mid-build.
+                await self.publish_status(label, "retrying")
+                await asyncio.sleep(delay)
+                delay *= 2
+
     async def run(self, prompt: str, parent_html: Optional[str] = None) -> Tuple[str, str]:
         # --- ARCHITECT ---
         await self.publish_status("architect", "thinking")
@@ -65,15 +103,18 @@ class AgentLoop:
 
         logger.info("Calling Architect...")
         # Run synchronous call in thread pool
-        arch_response = await asyncio.to_thread(
-            self.client.models.generate_content,
-            model=GEMINI_MODEL,
-            contents=user_msg,
-            config=types.GenerateContentConfig(
-                system_instruction=ARCHITECT_SYSTEM_PROMPT,
-                response_mime_type="application/json",
-                response_schema=ArchitectOutput,
-            )
+        arch_response = await self._with_retry(
+            lambda model: asyncio.to_thread(
+                self.client.models.generate_content,
+                model=model,
+                contents=user_msg,
+                config=types.GenerateContentConfig(
+                    system_instruction=ARCHITECT_SYSTEM_PROMPT,
+                    response_mime_type="application/json",
+                    response_schema=ArchitectOutput,
+                )
+            ),
+            "architect",
         )
         arch_plan = arch_response.text
         logger.info(f"Architect Plan: {arch_plan}")
@@ -93,15 +134,18 @@ class AgentLoop:
         await self.publish_status("reviewer", "thinking")
         reviewer_msg = f"ARCHITECT PLAN:\n{arch_plan}\n\nBUILDER HTML:\n{html_out}"
         logger.info("Calling Reviewer...")
-        rev_response = await asyncio.to_thread(
-            self.client.models.generate_content,
-            model=GEMINI_MODEL,
-            contents=reviewer_msg,
-            config=types.GenerateContentConfig(
-                system_instruction=REVIEWER_SYSTEM_PROMPT,
-                response_mime_type="application/json",
-                response_schema=ReviewerOutput,
-            )
+        rev_response = await self._with_retry(
+            lambda model: asyncio.to_thread(
+                self.client.models.generate_content,
+                model=model,
+                contents=reviewer_msg,
+                config=types.GenerateContentConfig(
+                    system_instruction=REVIEWER_SYSTEM_PROMPT,
+                    response_mime_type="application/json",
+                    response_schema=ReviewerOutput,
+                )
+            ),
+            "reviewer",
         )
         rev_result_str = rev_response.text
         logger.info(f"Reviewer Result: {rev_result_str}")
@@ -126,12 +170,20 @@ class AgentLoop:
         return html_out_2, arch_plan
 
     async def _stream_builder(self, message: str) -> str:
+        # A 503 can land on the initial call OR partway through the iterator, so the
+        # entire stream is retried as one unit — resuming would splice two different
+        # generations into one broken document.
+        return await self._with_retry(
+            lambda model: self._stream_builder_once(message, model), "builder"
+        )
+
+    async def _stream_builder_once(self, message: str, model: str) -> str:
         # We'll use a thread to get the iterator, but to avoid blocking the event loop 
         # completely while iterating, we iterate in thread too, or just accept it's a generator.
         # Since the iterator might do network I/O, we can wrap the `next()` calls.
         def get_stream():
             return self.client.models.generate_content_stream(
-                model=GEMINI_MODEL,
+                model=model,
                 contents=message,
                 config=types.GenerateContentConfig(
                     system_instruction=BUILDER_SYSTEM_PROMPT,

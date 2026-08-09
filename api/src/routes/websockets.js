@@ -6,6 +6,11 @@ module.exports = async function (fastify, opts) {
   // One dedicated subscriber connection per socket: in Redis/Valkey a connection in
   // subscribe mode can't be used for anything else.
   function relay(channel, connection) {
+    // @fastify/websocket v10 invokes the handler as wsHandler(socket, request) — the
+    // first argument IS the WebSocket. Older/newer releases wrap it as
+    // { socket }. Accept either so this doesn't silently break on an upgrade.
+    const ws = connection && connection.socket ? connection.socket : connection;
+
     const sub = new Redis(REDIS_URL, {
       maxRetriesPerRequest: null,
       retryStrategy: (times) => Math.min(times * 200, 5000),
@@ -25,13 +30,13 @@ module.exports = async function (fastify, opts) {
 
     sub.on('message', (chan, message) => {
       if (chan !== channel) return;
-      if (connection.socket.readyState !== connection.socket.OPEN) return;
-      connection.socket.send(message);
+      if (ws.readyState !== ws.OPEN) return;
+      ws.send(message);
     });
 
     const teardown = () => sub.quit().catch(() => sub.disconnect());
-    connection.socket.on('close', teardown);
-    connection.socket.on('error', teardown);
+    ws.on('close', teardown);
+    ws.on('error', teardown);
   }
 
   // WS /ws/projects/:id
