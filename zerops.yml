@@ -47,3 +47,4 @@ zerops:
         # project-level ones, so defining it would shadow the project-wide NATS_URL
         # set in the Zerops GUI — which is the one place its real value lives.
         QDRANT_URL: http://${vectors_hostname}:6333
+        QDRANT_API_KEY: ${vectors_apiKey}

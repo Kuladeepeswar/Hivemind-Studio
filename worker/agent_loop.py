@@ -57,6 +57,10 @@ Client-side state only (useState/useReducer) — destructure hooks from the glob
 Realistic mock data, no network calls, no localStorage, no fetch. Images only from https://picsum.photos.
 Make it visually polished with a real color palette and at least one working interaction.
 
+Tailwind's CDN generates its CSS after the page loads, so include a small inline
+<style> block in <head> that sets html/body background and text colour to match your
+palette. Without it the app flashes as unstyled white text for a second on load.
+
 Keep the whole document under ~500 lines so it never gets truncated.
 Output ONLY the raw HTML starting with <!doctype html> — no explanation, no markdown code fences."""
 

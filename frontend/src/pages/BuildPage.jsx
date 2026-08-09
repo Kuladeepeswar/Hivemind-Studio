@@ -25,7 +25,18 @@ export default function BuildPage() {
     fetch(`${getApiUrl()}/api/projects/${id}`)
       .then(res => res.json())
       .then(data => {
-        if (data.project) setStatus(data.project.status);
+        if (data.project) {
+          setStatus(data.project.status);
+          // Agent state normally arrives over the websocket, so reloading a finished
+          // build would otherwise show three IDLE cards next to a completed app.
+          if (data.project.status === 'done') {
+            setAgents({
+              architect: { status: 'done' },
+              builder: { status: 'done' },
+              reviewer: { status: 'done' },
+            });
+          }
+        }
         if (data.artifact) setHtml(data.artifact.html);
       })
       .catch(console.error);
@@ -113,7 +124,9 @@ export default function BuildPage() {
             ref={transcriptRef}
             className="flex-1 bg-gray-950 rounded-xl p-4 overflow-y-auto font-mono text-xs text-gray-300 border border-gray-800 whitespace-pre-wrap break-all"
           >
-            {transcript || "Waiting for output..."}
+            {transcript || (status === 'done'
+              ? "Build finished. The live transcript isn't replayed on reload — open the app or hit Remix."
+              : "Waiting for output...")}
           </div>
         </div>
 

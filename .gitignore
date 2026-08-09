@@ -12,6 +12,8 @@ venv/
 
 # test_cli.py scratch output
 worker/last_build*.html
+worker/prod_build.html
+worker/t_*.html
 
 .DS_Store
 .idea/

@@ -21,6 +21,9 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@lo
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
 NATS_URL = os.environ.get("NATS_URL", "nats://localhost:4222")
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
+# Zerops Qdrant requires API-key auth on every HTTP/gRPC call; without it every
+# request comes back 401 and the vector memory silently does nothing.
+QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY") or None
 
 EMBED_MODEL = os.environ.get("GEMINI_EMBED_MODEL", "gemini-embedding-2")
 # gemini-embedding-2 defaults to 3072 dims; we truncate to 768 to keep the
@@ -65,7 +68,7 @@ async def main():
     logger.info(f"Connected to Redis at {REDIS_URL}")
     
     # Connect to Qdrant
-    qclient = AsyncQdrantClient(url=QDRANT_URL)
+    qclient = AsyncQdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
     await init_qdrant(qclient)
 
     async def message_handler(msg):
