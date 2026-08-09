@@ -5,8 +5,16 @@ const fastifyWebsocket = require('@fastify/websocket');
 const { Pool } = require('pg');
 const { connect: connectNats } = require('nats');
 
+const Redis = require('ioredis');
+
 const DATABASE_URL = process.env.DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/postgres';
 const NATS_URL = process.env.NATS_URL || 'nats://localhost:4222';
+const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
+
+// Health-check only. The per-socket subscribers live in routes/websockets.js,
+// because a Redis connection in subscribe mode can't run other commands.
+const redisHealth = new Redis(REDIS_URL, { lazyConnect: true, maxRetriesPerRequest: 1 });
+redisHealth.on('error', (err) => fastify.log.error(`Redis health client: ${err.message}`));
 
 const pool = new Pool({ connectionString: DATABASE_URL });
 
@@ -48,6 +56,28 @@ async function start() {
       health.db = `down: ${err.message}`;
       health.ok = false;
     }
+
+    // The worker applies schema.sql on startup. If it never booted, the tables are
+    // missing and every POST fails with a confusing "relation does not exist".
+    if (health.db === 'up') {
+      try {
+        await pool.query('select 1 from projects limit 1');
+        health.schema = 'up';
+      } catch (err) {
+        health.schema = `missing (worker has not applied schema.sql): ${err.message}`;
+        health.ok = false;
+      }
+    }
+    try {
+      if (redisHealth.status === 'wait') await redisHealth.connect();
+      await redisHealth.ping();
+      health.redis = 'up';
+    } catch (err) {
+      health.redis = `down: ${err.message}`;
+      health.ok = false;
+    }
+    health.redisUrl = maskUrl(REDIS_URL);
+
     if (health.nats !== 'up') health.ok = false;
     return health;
   });
