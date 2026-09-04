@@ -17,7 +17,10 @@ export default function BuildPage() {
   });
   const [transcript, setTranscript] = useState('');
   const [html, setHtml] = useState('');
-  
+  // The worker sleeps after 15 min idle on Render's free tier and takes up to a
+  // minute to boot. Without this the page just sits there looking broken.
+  const [coldStart, setColdStart] = useState(false);
+
   const transcriptRef = useRef(null);
 
   useEffect(() => {
@@ -48,6 +51,7 @@ export default function BuildPage() {
     ws.onmessage = (event) => {
       try {
         const msg = JSON.parse(event.data);
+        setColdStart(false);
         if (msg.type === 'agent.status') {
           setAgents(prev => ({
             ...prev,
@@ -77,7 +81,18 @@ export default function BuildPage() {
       }
     };
 
-    return () => ws.close();
+    // If nothing has streamed after 8s the worker is almost certainly cold.
+    const coldTimer = setTimeout(() => {
+      setStatus((current) => {
+        if (current === 'queued' || current === 'running') setColdStart(true);
+        return current;
+      });
+    }, 8000);
+
+    return () => {
+      clearTimeout(coldTimer);
+      ws.close();
+    };
   }, [id]);
 
   const StatusIcon = ({ status }) => {
@@ -124,7 +139,9 @@ export default function BuildPage() {
             ref={transcriptRef}
             className="flex-1 bg-gray-950 rounded-xl p-4 overflow-y-auto font-mono text-xs text-gray-300 border border-gray-800 whitespace-pre-wrap break-all"
           >
-            {transcript || (status === 'done'
+            {transcript || (coldStart && status !== 'done'
+              ? "Waking the build worker. It sleeps when idle on the free tier, so the first build after a quiet spell can take up to a minute. The job is queued and will not be lost."
+              : null) || (status === 'done'
               ? "Build finished. The live transcript isn't replayed on reload — open the app or hit Remix."
               : "Waiting for output...")}
           </div>

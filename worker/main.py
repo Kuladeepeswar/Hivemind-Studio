@@ -1,185 +1,269 @@
-import os
-import json
+"""Hivemind Studio worker.
+
+Render has no background workers on the free tier, so this runs as a small web
+service instead. The API enqueues a row in `jobs` and pings POST /run to wake this
+process; the queue is the source of truth, the ping is only an optimisation.
+
+That distinction matters: on the free tier this service spins down after 15 minutes
+idle. A wake ping can land while the process is still booting, or be dropped
+entirely. Because work is claimed from Postgres rather than handed over in the
+request body, nothing is lost when that happens - the startup drain picks it up.
+"""
+
 import asyncio
+import contextlib
+import json
 import logging
-from datetime import datetime
+import os
+import sys
 
-import nats
 import redis.asyncio as redis
-from qdrant_client import AsyncQdrantClient
-from qdrant_client.models import PointStruct, VectorParams, Distance
+from fastapi import FastAPI
+from psycopg_pool import AsyncConnectionPool
 
-import psycopg
+from dotenv import load_dotenv
 
 from agent_loop import AgentLoop
+from llm import LLM, NoProvidersConfigured
+
+# Must run before the constants below read os.environ. No-op on Render, where the
+# platform injects real environment variables and no .env file exists.
+load_dotenv()
+
+# psycopg's async mode refuses to run on Windows' default ProactorEventLoop. Render
+# runs Linux where this is a no-op, but without it the worker cannot be run locally.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Config
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres")
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
-NATS_URL = os.environ.get("NATS_URL", "nats://localhost:4222")
-QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
-# Zerops Qdrant requires API-key auth on every HTTP/gRPC call; without it every
-# request comes back 401 and the vector memory silently does nothing.
-QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY") or None
+PORT = int(os.environ.get("PORT", "10000"))
 
-EMBED_MODEL = os.environ.get("GEMINI_EMBED_MODEL", "gemini-embedding-2")
-# gemini-embedding-2 defaults to 3072 dims; we truncate to 768 to keep the
-# Qdrant collection small. Must stay in sync with init_qdrant below.
-EMBED_DIM = 768
+# Neon's free tier allows far fewer connections than a dedicated Postgres, and the
+# old code opened a new one for every status event. One small pool instead.
+pool: AsyncConnectionPool | None = None
+r: redis.Redis | None = None
+llm: LLM | None = None
+
+# Guards against two overlapping drains racing each other when several wake pings
+# arrive at once. SKIP LOCKED would keep it correct, this keeps it tidy.
+drain_lock = asyncio.Lock()
+
+app = FastAPI()
 
 
-async def init_qdrant(qdrant):
-    # Ensure collection exists
-    try:
-        collections = await qdrant.get_collections()
-        if not any(c.name == "builds" for c in collections.collections):
-            await qdrant.create_collection(
-                collection_name="builds",
-                vectors_config=VectorParams(size=EMBED_DIM, distance=Distance.COSINE),
+async def apply_schema():
+    schema_path = os.path.join(os.path.dirname(__file__), "schema.sql")
+    if not os.path.exists(schema_path):
+        return
+    with open(schema_path, "r", encoding="utf-8") as f:
+        schema = f.read()
+    async with pool.connection() as conn:
+        await conn.execute(schema)
+    logger.info("Schema applied.")
+
+
+async def claim_job():
+    """Atomically take the oldest queued job.
+
+    FOR UPDATE SKIP LOCKED is what makes this safe to run in more than one process:
+    each claimer skips rows another transaction already holds instead of blocking.
+    """
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                update jobs set status = 'running',
+                                attempts = attempts + 1,
+                                started_at = now()
+                where id = (
+                    select id from jobs
+                    where status = 'queued'
+                    order by created_at
+                    for update skip locked
+                    limit 1
+                )
+                returning id, project_id, prompt, parent_html
+                """
             )
-    except Exception as e:
-        logger.error(f"Failed to init Qdrant: {e}")
+            return await cur.fetchone()
 
-async def run_db_schema():
-    schema_path = os.path.join(os.path.dirname(__file__), 'schema.sql')
-    if os.path.exists(schema_path):
-        with open(schema_path, 'r') as f:
-            schema = f.read()
-            try:
-                async with await psycopg.AsyncConnection.connect(DATABASE_URL) as aconn:
-                    async with aconn.cursor() as acur:
-                        await acur.execute(schema)
-                        logger.info("Schema applied successfully.")
-            except Exception as e:
-                logger.error(f"Error applying schema: {e}")
 
-async def main():
-    logger.info("Starting Hivemind Studio Worker...")
-    
-    # Connect to NATS
-    nc = await nats.connect(NATS_URL)
-    logger.info(f"Connected to NATS at {NATS_URL}")
+async def finish_job(job_id: int, status: str, error: str | None = None):
+    async with pool.connection() as conn:
+        await conn.execute(
+            "update jobs set status = %s, error = %s, finished_at = now() where id = %s",
+            (status, error, job_id),
+        )
 
-    # Connect to Redis/Valkey
-    r = redis.from_url(REDIS_URL)
-    logger.info(f"Connected to Redis at {REDIS_URL}")
-    
-    # Connect to Qdrant
-    qclient = AsyncQdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
-    await init_qdrant(qclient)
 
-    async def message_handler(msg):
-        subject = msg.subject
-        data = json.loads(msg.data.decode())
-        project_id = data.get("projectId")
-        prompt = data.get("prompt")
-        parent_html = data.get("parentHtml")
+async def set_project_status(project_id, status: str):
+    async with pool.connection() as conn:
+        await conn.execute(
+            "update projects set status = %s, updated_at = now() where id = %s",
+            (status, project_id),
+        )
 
-        logger.info(f"Received job for project {project_id}: '{prompt}'")
-        
-        async def publish_status(agent, status):
-            msg_obj = {"type": "agent.status", "agent": agent, "status": status}
-            msg_str = json.dumps(msg_obj)
-            await r.publish(f"project:{project_id}", msg_str)
-            await r.publish("firehose", msg_str)
-            # Log event in PG
-            async with await psycopg.AsyncConnection.connect(DATABASE_URL) as aconn:
-                async with aconn.cursor() as acur:
-                    await acur.execute(
-                        "INSERT INTO agent_events (project_id, agent, event_type, content) VALUES (%s, %s, %s, %s)",
-                        (project_id, agent, "status", status)
-                    )
 
-        async def publish_token(agent, delta):
-            msg_obj = {"type": "agent.token", "agent": agent, "delta": delta}
-            await r.publish(f"project:{project_id}", json.dumps(msg_obj))
+async def run_job(job_id: int, project_id, prompt: str, parent_html: str | None):
+    channel = "project:" + str(project_id)
 
-        async def publish_artifact(html):
-            msg_obj = {"type": "artifact.update", "html": html}
-            await r.publish(f"project:{project_id}", json.dumps(msg_obj))
+    async def publish(payload: dict, firehose: bool = False):
+        message = json.dumps(payload)
+        await r.publish(channel, message)
+        if firehose:
+            await r.publish("firehose", message)
 
-        try:
-            # Update status to running
-            async with await psycopg.AsyncConnection.connect(DATABASE_URL) as aconn:
-                async with aconn.cursor() as acur:
-                    await acur.execute("UPDATE projects SET status = 'running' WHERE id = %s", (project_id,))
-            
-            loop = AgentLoop(publish_status, publish_token, publish_artifact)
-            html, arch_plan_str = await loop.run(prompt, parent_html)
-            
-            # Save artifact
-            async with await psycopg.AsyncConnection.connect(DATABASE_URL) as aconn:
-                async with aconn.cursor() as acur:
-                    await acur.execute(
-                        "INSERT INTO artifacts (project_id, html) VALUES (%s, %s) RETURNING id",
-                        (project_id, html)
-                    )
-                    artifact_id = (await acur.fetchone())[0]
-                    await acur.execute("UPDATE projects SET status = 'done' WHERE id = %s", (project_id,))
-            
-            # Embed and save to Qdrant. This is memory for future builds, not part of
-            # the core loop — a Qdrant or embedding hiccup must never fail a build whose
-            # artifact is already saved and marked done.
-            try:
-                arch_plan = json.loads(arch_plan_str)
-                title = arch_plan.get("title", "App")
-                text_to_embed = f"{title} {prompt}"
+    async def publish_status(agent, status):
+        await publish({"type": "agent.status", "agent": agent, "status": status}, firehose=True)
+        async with pool.connection() as conn:
+            await conn.execute(
+                "insert into agent_events (project_id, agent, event_type, content)"
+                " values (%s, %s, %s, %s)",
+                (project_id, agent, "status", status),
+            )
 
-                # Use Gemini embedding. text-embedding-004 was shut down in Jan 2026.
-                from google import genai
-                from google.genai import types as genai_types
-                gclient = genai.Client()
-                emb_res = await asyncio.to_thread(
-                    gclient.models.embed_content,
-                    model=EMBED_MODEL,
-                    contents=text_to_embed,
-                    config=genai_types.EmbedContentConfig(output_dimensionality=EMBED_DIM),
-                )
-                vector = emb_res.embeddings[0].values
+    async def publish_token(agent, delta):
+        await publish({"type": "agent.token", "agent": agent, "delta": delta})
 
-                await qclient.upsert(
-                    collection_name="builds",
-                    points=[
-                        PointStruct(
-                            id=str(project_id),
-                            vector=vector,
-                            payload={"projectId": str(project_id), "prompt": prompt, "title": title}
-                        )
-                    ]
-                )
-            except Exception as qe:
-                logger.warning(f"Vector memory upsert failed for {project_id}: {qe}")
-
-            # Publish completion
-            msg_obj = {"type": "build.completed", "projectId": project_id, "artifactId": str(artifact_id)}
-            msg_str = json.dumps(msg_obj)
-            await r.publish(f"project:{project_id}", msg_str)
-            await r.publish("firehose", msg_str)
-            logger.info(f"Job completed for project {project_id}")
-
-        except Exception as e:
-            logger.error(f"Error processing job for {project_id}: {e}", exc_info=True)
-            async with await psycopg.AsyncConnection.connect(DATABASE_URL) as aconn:
-                async with aconn.cursor() as acur:
-                    await acur.execute("UPDATE projects SET status = 'failed' WHERE id = %s", (project_id,))
-            msg_obj = {"type": "build.failed", "error": str(e)}
-            await r.publish(f"project:{project_id}", json.dumps(msg_obj))
-
-    await nc.subscribe("build.jobs", queue="workers", cb=message_handler)
-    logger.info("Subscribed to build.jobs queue")
+    async def publish_artifact(html):
+        await publish({"type": "artifact.update", "html": html})
 
     try:
-        # Wait indefinitely
-        await asyncio.Event().wait()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        await nc.close()
+        await set_project_status(project_id, "running")
 
-if __name__ == '__main__':
-    # Initialize DB Schema before listening
-    asyncio.run(run_db_schema())
-    asyncio.run(main())
+        loop = AgentLoop(publish_status, publish_token, publish_artifact, llm=llm)
+        html, _plan = await loop.run(prompt, parent_html)
+
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "insert into artifacts (project_id, html) values (%s, %s) returning id",
+                    (project_id, html),
+                )
+                artifact_id = (await cur.fetchone())[0]
+
+        await set_project_status(project_id, "done")
+        await finish_job(job_id, "done")
+        await publish({
+            "type": "build.completed",
+            "projectId": str(project_id),
+            "artifactId": str(artifact_id),
+        }, firehose=True)
+        logger.info("Job %s completed for project %s", job_id, project_id)
+
+    except Exception as exc:
+        logger.error("Job %s failed for project %s: %s", job_id, project_id, exc, exc_info=True)
+        with contextlib.suppress(Exception):
+            await set_project_status(project_id, "failed")
+            await finish_job(job_id, "failed", str(exc)[:500])
+            await publish({"type": "build.failed", "error": str(exc)[:300]})
+
+
+async def drain():
+    """Process queued jobs until there are none left.
+
+    Runs as a fire-and-forget task, so it swallows its own errors: an unhandled
+    exception here would be an invisible dead task rather than a failed request.
+    """
+    if drain_lock.locked():
+        logger.info("Drain already running, skipping.")
+        return
+    async with drain_lock:
+        processed = 0
+        while True:
+            try:
+                job = await claim_job()
+            except Exception as exc:
+                logger.error("Could not claim a job: %s", exc)
+                break
+            if job is None:
+                break
+            job_id, project_id, prompt, parent_html = job
+            logger.info("Claimed job %s for project %s: %r", job_id, project_id, prompt)
+            await run_job(job_id, project_id, prompt, parent_html)
+            processed += 1
+        if processed:
+            logger.info("Drain finished, %d job(s) processed.", processed)
+
+
+@app.on_event("startup")
+async def startup():
+    global pool, r, llm
+    # timeout keeps /health and startup fast when the database is unreachable, rather
+    # than blocking for the 30s default and failing Render's health check.
+    pool = AsyncConnectionPool(DATABASE_URL, min_size=1, max_size=4,
+                               timeout=8, open=False)
+    await pool.open()
+    r = redis.from_url(REDIS_URL)
+    try:
+        llm = LLM()
+    except NoProvidersConfigured as exc:
+        # Do not crash: /health should be able to report this clearly rather than
+        # leaving Render in a restart loop with the reason buried in logs.
+        logger.error("No LLM providers configured: %s", exc)
+        llm = None
+
+    # A transient database blip at boot must not kill the process: Render would just
+    # restart it into the same failure, and /health could never report the reason.
+    try:
+        await apply_schema()
+    except Exception as exc:
+        logger.error("Could not apply schema at startup: %s", exc)
+
+    # Pick up anything enqueued while this service was asleep or restarting.
+    asyncio.create_task(drain())
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    if r is not None:
+        await r.aclose()
+    if pool is not None:
+        await pool.close()
+
+
+@app.post("/run", status_code=202)
+async def run():
+    """Wake-up hook. Returns immediately; the drain continues in the background."""
+    asyncio.create_task(drain())
+    return {"accepted": True}
+
+
+@app.get("/health")
+async def health():
+    out = {
+        "ok": True,
+        "providers": [p.name for p in llm.providers] if llm else [],
+        "draining": drain_lock.locked(),
+    }
+    if not out["providers"]:
+        out["ok"] = False
+        out["llm"] = "no providers configured"
+
+    try:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("select count(*) from jobs where status = 'queued'")
+                out["queued"] = (await cur.fetchone())[0]
+        out["db"] = "up"
+    except Exception as exc:
+        out["db"] = "down: " + str(exc)[:200]
+        out["ok"] = False
+
+    try:
+        await r.ping()
+        out["redis"] = "up"
+    except Exception as exc:
+        out["redis"] = "down: " + str(exc)[:200]
+        out["ok"] = False
+
+    return out
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=PORT)

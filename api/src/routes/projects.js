@@ -1,28 +1,44 @@
-const { JSONCodec } = require('nats');
-const jc = JSONCodec();
 const crypto = require('crypto');
 
 module.exports = async function (fastify, opts) {
-  // If the job never reaches the worker, the project would sit in "queued"
-  // forever with the UI spinning. Mark it failed and surface a 503 instead.
-  async function enqueue(projectId, payload) {
+  // The queue lives in Postgres, not in a broker: Render has no free message broker,
+  // and a job row survives a sleeping worker, a dropped wake-up ping and a worker
+  // restart. The ping below is only an optimisation to skip the poll interval.
+  async function enqueue(projectId, prompt, parentHtml) {
     try {
-      if (!fastify.nc || fastify.nc.isClosed()) {
-        throw new Error('not connected to NATS');
-      }
-      fastify.nc.publish('build.jobs', jc.encode(payload));
+      await fastify.db.query(
+        'INSERT INTO jobs (project_id, prompt, parent_html) VALUES ($1, $2, $3)',
+        [projectId, prompt, parentHtml || null]
+      );
     } catch (err) {
       fastify.log.error(`Failed to enqueue build for ${projectId}: ${err.message}`);
       try {
         await fastify.db.query("UPDATE projects SET status = 'failed' WHERE id = $1", [projectId]);
       } catch (dbErr) {
-        // Best effort — don't let a second failure mask the 503 we owe the client.
+        // Best effort - do not let a second failure mask the 503 we owe the client.
         fastify.log.error(`Also failed to mark ${projectId} failed: ${dbErr.message}`);
       }
-      const e = new Error(`Build queue unavailable (${err.message}). Check the API's /health.`);
+      const e = new Error(`Could not queue the build (${err.message}). Check the API /health.`);
       e.statusCode = 503;
       throw e;
     }
+
+    wakeWorker(projectId);
+  }
+
+  // Fire-and-forget. On Render's free tier the worker sleeps after 15 minutes idle and
+  // takes ~50s to boot, so awaiting this would stall the HTTP response for no benefit:
+  // the job is already durable in Postgres and the worker drains the queue on startup.
+  function wakeWorker(projectId) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 2000);
+    fetch(`${fastify.workerUrl}/run`, { method: 'POST', signal: controller.signal })
+      .then(() => fastify.log.info(`Worker pinged for ${projectId}`))
+      .catch((err) => {
+        // Expected while a sleeping worker boots. The startup drain covers it.
+        fastify.log.warn(`Worker ping failed for ${projectId} (${err.message}); queue will be drained on boot`);
+      })
+      .finally(() => clearTimeout(timer));
   }
 
   // POST /api/projects
@@ -36,7 +52,7 @@ module.exports = async function (fastify, opts) {
     );
     const project = dbRes.rows[0];
 
-    await enqueue(project.id, { projectId: project.id, prompt });
+    await enqueue(project.id, prompt, null);
 
     return { id: project.id, status: project.status, sessionId };
   });
@@ -96,11 +112,7 @@ module.exports = async function (fastify, opts) {
     );
     const newProject = dbRes.rows[0];
 
-    await enqueue(newProject.id, {
-      projectId: newProject.id,
-      prompt,
-      parentHtml,
-    });
+    await enqueue(newProject.id, prompt, parentHtml);
 
     return { id: newProject.id, status: newProject.status, sessionId };
   });

@@ -1,0 +1,93 @@
+# Render Blueprint for Hivemind Studio.
+#
+# Postgres is deliberately NOT defined here. Render's free Postgres is deleted 30 days
+# after creation, which is useless for anything long-lived, so DATABASE_URL points at a
+# Neon project instead and is set by hand on both services.
+#
+# Note on the free tier: web services sleep after 15 minutes idle and share a single
+# 750 instance-hour monthly pool across the workspace. Do not point an uptime pinger at
+# both services or the pool is gone before the month ends.
+
+services:
+  # ---------------------------------------------------------------- frontend
+  # Static sites are free, unlimited and never sleep, so the landing page is always
+  # instant even when the API behind it is cold.
+  - name: hivemind-web
+    type: web
+    runtime: static
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    staticPublishPath: ./dist
+    envVars:
+      # Baked into the bundle at build time by Vite. `host` is a bare hostname; the
+      # scheme is added in frontend/src/config.js.
+      - key: VITE_API_URL
+        fromService:
+          name: hivemind-api
+          type: web
+          property: host
+    routes:
+      # Client-side routing: /build/:id and /app/:id must serve index.html rather
+      # than 404. Zerops did this automatically, Render needs it spelled out.
+      - type: rewrite
+        source: /*
+        destination: /index.html
+
+  # ---------------------------------------------------------------- api
+  - name: hivemind-api
+    type: web
+    runtime: node
+    plan: free
+    rootDir: api
+    buildCommand: npm install && npm run build
+    startCommand: node dist/index.js
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        sync: false # Neon pooled connection string
+      - key: REDIS_URL
+        fromService:
+          name: hivemind-cache
+          type: keyvalue
+          property: connectionString
+      - key: WORKER_URL
+        fromService:
+          name: hivemind-worker
+          type: web
+          property: host
+
+  # ---------------------------------------------------------------- worker
+  # A web service rather than a background worker, because Render has no free
+  # background workers. It is woken by POST /run and drains the Postgres job queue.
+  - name: hivemind-worker
+    type: web
+    runtime: python
+    plan: free
+    rootDir: worker
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        sync: false # same Neon connection string as the api
+      - key: REDIS_URL
+        fromService:
+          name: hivemind-cache
+          type: keyvalue
+          property: connectionString
+      # At least one of these is required. They are tried in order, so a daily cap on
+      # one provider does not take the whole app down. See worker/llm.py.
+      - key: GROQ_API_KEY
+        sync: false
+      - key: CEREBRAS_API_KEY
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+
+  # ---------------------------------------------------------------- pub/sub
+  # Carries live agent events from the worker to the api, which relays them over the
+  # websocket. Pub/sub keeps nothing on disk, so the 25MB free instance is plenty.
+  - name: hivemind-cache
+    type: keyvalue
+    plan: free
+    ipAllowList: [] # internal access only

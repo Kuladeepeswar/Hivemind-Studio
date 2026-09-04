@@ -3,7 +3,7 @@ const Redis = require('ioredis');
 const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
 
 module.exports = async function (fastify, opts) {
-  // One dedicated subscriber connection per socket: in Redis/Valkey a connection in
+  // One dedicated subscriber connection per socket: in Redis a connection in
   // subscribe mode can't be used for anything else.
   function relay(channel, connection) {
     // @fastify/websocket v10 invokes the handler as wsHandler(socket, request) — the
@@ -16,10 +16,10 @@ module.exports = async function (fastify, opts) {
       retryStrategy: (times) => Math.min(times * 200, 5000),
     });
 
-    // Without this listener a Valkey blip is an uncaught 'error' event, which takes
+    // Without this listener a Key Value blip is an uncaught 'error' event, which takes
     // down the entire API process — not just this one websocket.
     sub.on('error', (err) => {
-      fastify.log.error(`Valkey subscriber error on ${channel}: ${err.message}`);
+      fastify.log.error(`Redis subscriber error on ${channel}: ${err.message}`);
     });
 
     sub.subscribe(channel, (err) => {
