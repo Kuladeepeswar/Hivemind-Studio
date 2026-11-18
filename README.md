@@ -23,7 +23,7 @@ Groq / Cerebras / OpenRouter still has quota left today.
 
 Generated apps render in an `<iframe sandbox="allow-scripts">` with no
 `allow-same-origin`, plus a CSP that only allows the CDNs the Builder is told to use.
-That is demo-grade isolation, not a security guarantee..
+That is demo-grade isolation, not a security guarantee.
 
 ### Why the queue is a table and not a broker
 
